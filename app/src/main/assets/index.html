@@ -50,6 +50,24 @@ const rnd = (a, b) => a + Math.random() * (b - a);
 // ==========================================
 // TUNING CONSTANTS (Scale, Speed, Physics, SFX)
 // ==========================================
+const FINISH_RUN_SPEED = 1.2 * W;     // scroll speed during finish run (px/s)
+const ROAD_END_STOP_X = 0.96 * W;     // screen X where road safety rail stops
+const FINISH_LINE_X = 0.70 * W;       // screen X where finish line is positioned when scroll stops
+const CAR_STOP_FRONT_X = 0.82 * W;    // screen X where front of car stops
+const CHARACTER_X = 0.89 * W;         // screen X where cheering character stands
+
+// Wheel numbers (fractions of trimmed picture: x from left, y from top, radius as fraction of width)
+const WHEEL_REAR_X = 0.215;
+const WHEEL_FRONT_X = 0.776;
+const WHEEL_Y = 0.775;
+const WHEEL_RADIUS = 0.07;
+const WHEEL_SPIN_RADIUS = 0.80 * WHEEL_RADIUS;
+const SHOW_WHEEL_DEBUG = false;       // When true, draw thin green circles at wheel positions
+
+// Car visibility & glow constants
+const CAR_GLOW_COLOR = 'rgba(120, 230, 255, 0.55)';
+const CAR_GLOW_BLUR = 8;
+
 const SFX_VOLUME = 0.8;
 const PUFF_INTERVAL = 0.2;
 
@@ -86,14 +104,6 @@ let CAR_REST_Y = ROAD_TOP + Math.round(ROAD_LANE_H / 2);
 const TUNNEL_CENTER_MIN = 0.36;
 const TUNNEL_CENTER_MAX = 0.60;
 const TUNNEL_START_CENTER = 0.50;
-
-// Wheel configuration constants (fractions of trimmed car image)
-const WHEEL_REAR_X = 0.194;
-const WHEEL_FRONT_X = 0.761;
-const WHEEL_Y = 0.681;            // from the top of the image
-const WHEEL_RADIUS = 0.085;      // of the image width
-const WHEEL_SPIN_RADIUS = 0.78 * WHEEL_RADIUS; // Perfectly fills the rim opening inside tire
-const SHOW_WHEEL_DEBUG = false;  // When true, draw thin green circles at wheel positions
 
 const lerp = (a, b, t) => a + (b - a) * t;
 
@@ -135,20 +145,29 @@ const SPIKE_BIG_MAX_LEVEL = 20;
 
 const START_ROAD_START = -50, START_ROAD_END = 800;
 const TUNNEL_START_X = START_ROAD_END;
-let TUNNEL_LENGTH = 4800;               // Substantially bigger stage length (4800px - 6000px)
+
+const LEVEL_BASE_WIDTHS = 14;
+const LEVEL_GROWTH = 0.4;
+const LEVEL_MAX_EXTRA = 10;
+
+function getTunnelLength(lvl) {
+  const L = lvl || 1;
+  const extra = Math.min(LEVEL_MAX_EXTRA, LEVEL_GROWTH * (L - 1));
+  return Math.round((LEVEL_BASE_WIDTHS + extra) * W);
+}
+
+let TUNNEL_LENGTH = getTunnelLength(1);
 let TUNNEL_END_X = TUNNEL_START_X + TUNNEL_LENGTH;
 const CALM_OPEN_GAP = 300;
 
-// Long finish road, checkered finish line, and stopping constants
-const FINISH_ROAD_LENGTH = 3.2 * W;
-const FINISH_LINE_AT = 0.45;
+// Long finish road and stopping constants
+const FINISH_ROAD_LENGTH = 1.3 * W;
 const STOP_TIME = 1.4;
 
 let FINISH_ROAD_LEN = FINISH_ROAD_LENGTH;
 let FINISH_ROAD_X = TUNNEL_END_X + CALM_OPEN_GAP;
 let FINISH_ROAD_END = FINISH_ROAD_X + FINISH_ROAD_LENGTH;
-let FINISH_LINE_X = FINISH_ROAD_X + FINISH_ROAD_LENGTH * FINISH_LINE_AT;
-let LEVEL_LENGTH = FINISH_LINE_X - CAR_X;
+let LEVEL_LENGTH = FINISH_ROAD_X - CAR_X;
 
 const RETRY_FROM_LEVEL_START = true;
 
@@ -218,7 +237,7 @@ function mulberry32(a) {
 const LEVEL_PICTURE_URLS = [
   'image_39e1ec82.png' // Level 1 custom bright picture
 ];
-const CAR_IMAGE_URL = 'car_active.png';
+const CAR_IMAGE_URL = 'image_5d751a23.png';
 
 let carImgLoaded = false;
 let carImgFailed = false;
@@ -304,36 +323,89 @@ function processCarImage(img) {
     const imgData = offCtx.getImageData(0, 0, origW, origH);
     const d = imgData.data;
 
-    // Check if the image already contains transparency (pre-cut transparent PNG)
-    let hasAlpha = false;
-    for (let i = 3; i < d.length; i += 16) {
-      if (d[i] < 200) {
-        hasAlpha = true;
+    // 1. Check if picture already has transparent areas
+    let hasTransparency = false;
+    for (let i = 3; i < d.length; i += 4) {
+      if (d[i] < 250) {
+        hasTransparency = true;
         break;
       }
     }
 
-    if (!hasAlpha) {
-      // Remove studio white/grey background and ground plane
+    if (!hasTransparency) {
+      // 2. Smooth Green Chroma Key: treat pixel as background when g > r + 50 and g > b + 50, with soft edges
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i];
+        const g = d[i + 1];
+        const b = d[i + 2];
+        const diffR = g - r;
+        const diffB = g - b;
+        const minDiff = Math.min(diffR, diffB);
+
+        if (minDiff >= 50) {
+          d[i + 3] = 0;
+        } else if (minDiff > 35) {
+          // Soft edge blending
+          const factor = (minDiff - 35) / 15.0;
+          d[i + 3] = Math.round(255 * (1.0 - factor));
+        } else {
+          d[i + 3] = 255;
+        }
+      }
+
+      // 3. Despill edge pixels & clean windows:
+      // For every remaining pixel next to the removed area, if g > max(r, b) + 10 and b is not greater than g, set g = max(r, b).
+      // Skip bright cyan pixels (b > g), because the cyan light lines of the car must stay untouched.
+      // Ensure no green fringe around the car and no green in the windows.
+      const initialAlpha = new Uint8Array(origW * origH);
+      for (let i = 0; i < initialAlpha.length; i++) {
+        initialAlpha[i] = d[i * 4 + 3];
+      }
+
       for (let y = 0; y < origH; y++) {
         for (let x = 0; x < origW; x++) {
           const idx = (y * origW + x) * 4;
-          const r = d[idx], g = d[idx + 1], b = d[idx + 2];
-          if (y >= 634) {
-            d[idx + 3] = 0;
-          } else if (y > 628 && r > 120 && g > 120 && b > 115) {
-            d[idx + 3] = 0;
-          } else if (Math.min(r, g, b) >= 155 && Math.abs(r - g) <= 12 && Math.abs(r - b) <= 18) {
-            d[idx + 3] = 0;
-          } else if (r >= 230 && g >= 230 && b >= 225) {
-            d[idx + 3] = 0;
+          if (d[idx + 3] === 0) continue;
+
+          let isEdge = false;
+          for (let dy = -2; dy <= 2; dy++) {
+            for (let dx = -2; dx <= 2; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const nx = x + dx;
+              const ny = y + dy;
+              if (nx >= 0 && nx < origW && ny >= 0 && ny < origH) {
+                if (initialAlpha[ny * origW + nx] < 128) {
+                  isEdge = true;
+                  break;
+                }
+              }
+            }
+            if (isEdge) break;
+          }
+
+          const r = d[idx];
+          const g = d[idx + 1];
+          const b = d[idx + 2];
+
+          // Skip bright cyan pixels (b > g), cyan light lines untouched
+          if (b <= g) {
+            const maxRB = Math.max(r, b);
+            if (g > maxRB + 10) {
+              if (isEdge) {
+                d[idx + 1] = maxRB;
+              } else if (g > maxRB + 20) {
+                // Remove green tint from inside windows
+                d[idx + 1] = maxRB;
+              }
+            }
           }
         }
       }
-      offCtx.putImageData(imgData, 0, 0);
     }
 
-    // Auto-trim empty transparent space so tires sit at exact bottom edge
+    offCtx.putImageData(imgData, 0, 0);
+
+    // 4. Auto-trim empty transparent space so car fills image box exactly (lowest points of tires are bottom edge)
     let minX = origW, maxX = 0, minY = origH, maxY = 0;
     for (let y = 0; y < origH; y++) {
       for (let x = 0; x < origW; x++) {
@@ -367,7 +439,7 @@ function processCarImage(img) {
     carImgLoaded = true;
   } catch (err) {
     console.warn('Failed to process car image:', err);
-    if (!loadingErrorMsg) loadingErrorMsg = 'ProcessCar: ' + (err.message || String(err));
+    if (!loadingErrorMsg) loadingErrorMsg = 'ChromaKey: ' + (err.message || String(err));
   }
 }
 
@@ -655,14 +727,45 @@ function createCustomAlloyRim(size = 256, styleKey = currentRimStyle) {
 
 function buildWheelSprites() {
   try {
-    const sprite = createCustomAlloyRim(256, currentRimStyle);
-    if (sprite) {
-      rearWheelSprite = sprite;
-      frontWheelSprite = sprite;
-      wheelSpritesReady = true;
+    if (!trimmedCarCanvas) return;
+    const trimW = trimmedCarCanvas.width;
+    const trimH = trimmedCarCanvas.height;
+
+    const rearCenterPxX = trimW * WHEEL_REAR_X;
+    const rearCenterPxY = trimH * WHEEL_Y;
+    const frontCenterPxX = trimW * WHEEL_FRONT_X;
+    const frontCenterPxY = trimH * WHEEL_Y;
+    const rimRadiusPx = trimW * WHEEL_SPIN_RADIUS;
+    const rimDiamPx = Math.ceil(rimRadiusPx * 2);
+
+    function extractRimSprite(centerX, centerY) {
+      const canv = document.createElement('canvas');
+      canv.width = rimDiamPx;
+      canv.height = rimDiamPx;
+      const c = canv.getContext('2d');
+      if (!c) return null;
+
+      // Concentric circular clip mask for the spinning alloy rim
+      c.save();
+      c.beginPath();
+      c.arc(rimRadiusPx, rimRadiusPx, rimRadiusPx, 0, Math.PI * 2);
+      c.closePath();
+      c.clip();
+
+      c.drawImage(
+        trimmedCarCanvas,
+        centerX - rimRadiusPx, centerY - rimRadiusPx, rimDiamPx, rimDiamPx,
+        0, 0, rimDiamPx, rimDiamPx
+      );
+      c.restore();
+      return canv;
     }
+
+    rearWheelSprite = extractRimSprite(rearCenterPxX, rearCenterPxY);
+    frontWheelSprite = extractRimSprite(frontCenterPxX, frontCenterPxY);
+    wheelSpritesReady = !!(rearWheelSprite && frontWheelSprite);
   } catch (err) {
-    console.warn('Failed to build alloy wheel sprite:', err);
+    console.warn('Failed to extract alloy rim sprites:', err);
     rearWheelSprite = null;
     frontWheelSprite = null;
     wheelSpritesReady = false;
@@ -737,26 +840,12 @@ function initAssetPreloading() {
         }
       })
       .catch((err) => {
-        console.warn('Car image load failed, trying raw image:', err);
-        loadImageWithTimeout('image_0e358c67.png')
-          .then((img) => {
-            processCarImage(img);
-            carImgLoaded = true;
-          })
-          .catch((err2) => {
-            console.warn('Raw car image also failed:', err2);
-            carImgFailed = true;
-            if (!loadingErrorMsg) loadingErrorMsg = 'Car load failed: ' + (err2.message || String(err2));
-          })
-          .finally(() => {
-            markAssetFinished();
-          });
-        return;
+        console.warn('Car image load failed:', err);
+        carImgFailed = true;
+        if (!loadingErrorMsg) loadingErrorMsg = 'Car load failed: ' + (err.message || String(err));
       })
       .finally(() => {
-        if (!carImgFailed) {
-          markAssetFinished();
-        }
+        markAssetFinished();
       });
 
   } catch (err) {
@@ -955,7 +1044,7 @@ function playSinglePuff(isInitial = false) {
 }
 
 function updateThrustAudio(dt) {
-  const isThrustActive = (st === 'play' && hold && !autoLanding && !stopping && !settingsOpen);
+  const isThrustActive = (st === 'play' && hold && !stopping && !settingsOpen);
 
   if (!soundEnabled || !isThrustActive) {
     wasThrustActive = false;
@@ -1718,9 +1807,21 @@ let stopping = false;
 let stopTimer = 0;
 let levelCompleteTimer = 0;
 let levelJustCleared = 1;
-let autoLanding = false;
-let landingStartY = CAR_REST_Y;
+let safetyLanding = false;
+let safetyLandingStartY = CAR_REST_Y;
+let safetyLandingTimer = 0;
 let hasTouchedDown = false;
+let finishRunStage = 'none'; // 'none' | 'speed_run' | 'scroll_stopping' | 'car_driving' | 'car_stopped'
+let finishRunTimer = 0;
+let landingScrollSpeed = 0;
+let scrollStopTimer = 0;
+let camEaseStart = 0;
+let camEaseDist = 0;
+let carDriveTimer = 0;
+let thumbsUpTimer = 0;
+let confettiStarted = false;
+let levelCompleted = false;
+let carDrawX = CAR_X;
 let winCelebrated = false;
 let confettis = [];
 let activePress = null;
@@ -2153,9 +2254,20 @@ function startLevel(lvl) {
   parts = [];
   stopping = false;
   stopTimer = 0;
-  autoLanding = false;
-  landingStartY = CAR_REST_Y;
+  safetyLanding = false;
+  safetyLandingTimer = 0;
   hasTouchedDown = false;
+  finishRunStage = 'none';
+  finishRunTimer = 0;
+  landingScrollSpeed = 0;
+  scrollStopTimer = 0;
+  camEaseStart = 0;
+  camEaseDist = 0;
+  carDriveTimer = 0;
+  thumbsUpTimer = 0;
+  confettiStarted = false;
+  levelCompleted = false;
+  carDrawX = CAR_X;
   winCelebrated = false;
   levelCompleteTimer = 0;
   levelJustCleared = 0;
@@ -2165,13 +2277,11 @@ function startLevel(lvl) {
   realSpeedWPerSec = 0;
   realSpeedPxPerSec = 0;
 
-  const fProg = 1 - Math.exp(-(lvl - 1) / LEVEL_GROWTH_TAU);
-  TUNNEL_LENGTH = Math.round(4800 + 1200 * fProg);
+  TUNNEL_LENGTH = getTunnelLength(lvl);
   TUNNEL_END_X = TUNNEL_START_X + TUNNEL_LENGTH;
   FINISH_ROAD_X = TUNNEL_END_X + CALM_OPEN_GAP;
   FINISH_ROAD_END = FINISH_ROAD_X + FINISH_ROAD_LENGTH;
-  FINISH_LINE_X = FINISH_ROAD_X + FINISH_ROAD_LENGTH * FINISH_LINE_AT;
-  LEVEL_LENGTH = FINISH_LINE_X - CAR_X;
+  LEVEL_LENGTH = FINISH_ROAD_X - CAR_X;
 
   const cfg = getLevelConfig(lvl);
   curConfig = cfg;
@@ -2279,6 +2389,228 @@ function die() {
   }
 }
 
+// Friendly stylized cartoon character on finish road
+function drawFinishCharacter(charX, roadTop) {
+  if (charX < -50 || charX > W + 50) return;
+
+  const footY = roadTop + 24; // Standing on asphalt surface
+  const isCarStopped = (finishRunStage === 'car_stopped' || st === 'level_complete');
+
+  let jumpY = 0;
+  if (isCarStopped) {
+    const jumpT = Math.min(1.0, thumbsUpTimer / 0.42);
+    jumpY = Math.sin(jumpT * Math.PI) * 11;
+  }
+  const baseY = footY - jumpY;
+
+  ctx.save();
+
+  // 1. Soft ground shadow on asphalt
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.32)';
+  ctx.beginPath();
+  const shadowScale = Math.max(0.5, 1 - jumpY * 0.04);
+  ctx.ellipse(charX, footY + 1, 12 * shadowScale, 3.8 * shadowScale, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 2. Dress shoes (shiny black with glossy white rim)
+  ctx.fillStyle = '#0f172a';
+  ctx.beginPath();
+  ctx.ellipse(charX - 5.5, baseY - 2, 5, 3, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(charX + 5.5, baseY - 2, 5, 3, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+  ctx.fillRect(charX - 7, baseY - 4, 3, 1.5);
+  ctx.fillRect(charX + 4, baseY - 4, 3, 1.5);
+
+  // 3. Tailored black trousers
+  ctx.fillStyle = '#1e293b';
+  ctx.fillRect(charX - 8, baseY - 22, 5.5, 20);
+  ctx.fillRect(charX + 2.5, baseY - 22, 5.5, 20);
+  ctx.fillStyle = '#334155';
+  ctx.fillRect(charX - 5.5, baseY - 20, 1, 16);
+  ctx.fillRect(charX + 5, baseY - 20, 1, 16);
+
+  // 4. Black suit jacket body
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(charX - 9.5, baseY - 42, 19, 21);
+  ctx.fillStyle = '#1e293b';
+  ctx.fillRect(charX - 8.5, baseY - 41, 17, 19);
+
+  // 5. White shirt & red tie
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.moveTo(charX - 4.5, baseY - 42);
+  ctx.lineTo(charX + 4.5, baseY - 42);
+  ctx.lineTo(charX, baseY - 30);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#dc2626';
+  ctx.beginPath();
+  ctx.moveTo(charX - 1.5, baseY - 40);
+  ctx.lineTo(charX + 1.5, baseY - 40);
+  ctx.lineTo(charX + 2, baseY - 31);
+  ctx.lineTo(charX, baseY - 28);
+  ctx.lineTo(charX - 2, baseY - 31);
+  ctx.closePath();
+  ctx.fill();
+
+  // 6. Suit lapels
+  ctx.fillStyle = '#0f172a';
+  ctx.beginPath();
+  ctx.moveTo(charX - 9, baseY - 42);
+  ctx.lineTo(charX - 4, baseY - 34);
+  ctx.lineTo(charX - 6, baseY - 34);
+  ctx.closePath();
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(charX + 9, baseY - 42);
+  ctx.lineTo(charX + 4, baseY - 34);
+  ctx.lineTo(charX + 6, baseY - 34);
+  ctx.closePath();
+  ctx.fill();
+
+  // 7. Left arm (at side / hip)
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(charX - 12.5, baseY - 41, 3.5, 17);
+  ctx.fillStyle = '#fed7aa';
+  ctx.beginPath();
+  ctx.arc(charX - 10.5, baseY - 23, 2.8, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 8. Right arm (waving vs thumbs up)
+  ctx.fillStyle = '#0f172a';
+  if (!isCarStopped) {
+    // Waving while car comes near
+    const waveAngle = Math.sin(gameTime * 8) * 0.4;
+    ctx.save();
+    ctx.translate(charX + 9, baseY - 40);
+    ctx.rotate(waveAngle - 0.4);
+    ctx.fillRect(0, -16, 3.5, 17);
+    ctx.fillStyle = '#fed7aa';
+    ctx.beginPath();
+    ctx.arc(1.7, -18, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(0.5, -23, 1.2, 5);
+    ctx.fillRect(2.2, -23, 1.2, 5);
+    ctx.fillRect(-1.0, -21, 1.2, 4);
+    ctx.restore();
+  } else {
+    // Clear thumbs-up when car has stopped
+    ctx.save();
+    ctx.translate(charX + 9, baseY - 38);
+    ctx.fillRect(0, -14, 3.8, 14);
+    ctx.fillStyle = '#fed7aa';
+    ctx.beginPath();
+    ctx.arc(2, -16, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    roundRect(ctx, 1, -25, 3.2, 10, 1.6);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 9. Friendly stylized cartoon head
+  const headY = baseY - 49;
+  ctx.fillStyle = '#fed7aa';
+  ctx.fillRect(charX - 2.5, headY + 4, 5, 5);
+  ctx.beginPath();
+  ctx.ellipse(charX, headY, 7.5, 8.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Rosy cheeks
+  ctx.fillStyle = 'rgba(251, 113, 133, 0.45)';
+  ctx.beginPath();
+  ctx.arc(charX - 5, headY + 1.5, 2.2, 0, Math.PI * 2);
+  ctx.arc(charX + 5, headY + 1.5, 2.2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Big friendly warm smile with white teeth
+  ctx.fillStyle = '#0f172a';
+  ctx.beginPath();
+  ctx.arc(charX, headY + 1.5, 4.2, 0.15, Math.PI - 0.15);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.rect(charX - 3, headY + 1.5, 6, 2);
+  ctx.fill();
+
+  // Cheerful eyes (^ ^ smiling arcs)
+  ctx.strokeStyle = '#0f172a';
+  ctx.lineWidth = 1.4;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(charX - 3.5, headY - 1.5, 2.2, Math.PI + 0.3, Math.PI * 2 - 0.3);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(charX + 3.5, headY - 1.5, 2.2, Math.PI + 0.3, Math.PI * 2 - 0.3);
+  ctx.stroke();
+
+  // Short dark hair (glossy cartoon style)
+  ctx.fillStyle = '#0f172a';
+  ctx.beginPath();
+  ctx.arc(charX, headY - 2.5, 8.2, Math.PI * 0.9, Math.PI * 2.1);
+  ctx.lineTo(charX + 8, headY + 1);
+  ctx.lineTo(charX + 6, headY - 1);
+  ctx.lineTo(charX - 6, headY - 1);
+  ctx.lineTo(charX - 8, headY + 1);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#334155';
+  ctx.beginPath();
+  ctx.ellipse(charX - 1.5, headY - 8.5, 4.5, 1.8, -0.2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 10. "YES!" speech bubble pops up above him for 1.5 seconds when car has stopped
+  if (isCarStopped && thumbsUpTimer <= 1.5) {
+    const bubbleProgress = Math.min(1.0, thumbsUpTimer / 0.15);
+    const bubbleScale = Math.sin(bubbleProgress * Math.PI * 0.5);
+    const bubbleX = charX;
+    const bubbleY = headY - 22;
+
+    ctx.save();
+    ctx.translate(bubbleX, bubbleY);
+    ctx.scale(bubbleScale, bubbleScale);
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    ctx.beginPath();
+    roundRect(ctx, -23, -13, 46, 24, 7);
+    ctx.fill();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = '#0f172a';
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    roundRect(ctx, -23, -15, 46, 24, 7);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(-4, 9);
+    ctx.lineTo(0, 16);
+    ctx.lineTo(5, 9);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(-3, 7, 7, 3);
+
+    ctx.font = '900 13px "Lilita One", "Baloo 2", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#16a34a';
+    ctx.fillText('YES!', 0, -3);
+
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
 // 3-layer cartoon road platform with red deck edge and soft shadow
 function drawRoadPlatform(startX, endX, roadTop, isFinish = false) {
   const w = endX - startX;
@@ -2349,8 +2681,13 @@ function drawRoadPlatform(startX, endX, roadTop, isFinish = false) {
   if (isFinish) {
     ctx.save();
     const cfg = curConfig;
-    const finishLineWx = startX + (endX - startX) * FINISH_LINE_AT;
+    const camStop = endX - ROAD_END_STOP_X;
+    const finishLineWx = camStop + FINISH_LINE_X;
+    const characterWx = camStop + CHARACTER_X;
+
     const flX = finishLineWx - cam;
+    const railScreenX = endX - cam;
+    const charX = characterWx - cam;
 
     // 1. Checkered Finish Line Strip across the asphalt road
     if (flX > -40 && flX < W + 40) {
@@ -2374,7 +2711,7 @@ function drawRoadPlatform(startX, endX, roadTop, isFinish = false) {
       ctx.fillRect(flX + stripW / 2, roadTop, 1.5, bandH);
       ctx.restore();
 
-      // 2. Two Finish Flags placed at about 85% of the road length
+      // 2. Two Finish Flags on sides of the finish line
       for (const side of [-1, 1]) {
         const poleX = flX + side * 15;
         const poleBaseY = roadTop + 2;
@@ -2413,7 +2750,6 @@ function drawRoadPlatform(startX, endX, roadTop, isFinish = false) {
     }
 
     // 3. Safety rail at the end of the road
-    const railScreenX = endX - cam;
     if (railScreenX > -40 && railScreenX < W + 40) {
       const rx = railScreenX - 8;
       // Heavy steel posts
@@ -2449,51 +2785,9 @@ function drawRoadPlatform(startX, endX, roadTop, isFinish = false) {
       ctx.fillRect(rx + 3, roadTop - 28, 7, 3);
     }
 
-    // 4. Small man in black suit cheering after the finish line
-    const manWx = finishLineWx + 30;
-    const manX = manWx - cam;
-    if (manX > -30 && manX < W + 30) {
-      const footY = roadTop + 24; // Standing on asphalt surface
-      // Shadow
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
-      ctx.beginPath();
-      ctx.ellipse(manX, footY + 1, 9, 3, 0, 0, 6.28);
-      ctx.fill();
-      // Legs (black trousers)
-      ctx.fillStyle = '#0f172a';
-      ctx.fillRect(manX - 5, footY - 14, 4, 14);
-      ctx.fillRect(manX + 1, footY - 14, 4, 14);
-      // Torso / Suit jacket (black)
-      ctx.fillStyle = '#1e293b';
-      ctx.fillRect(manX - 7, footY - 30, 14, 17);
-      // White shirt collar & red tie
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.moveTo(manX - 3, footY - 30);
-      ctx.lineTo(manX + 3, footY - 30);
-      ctx.lineTo(manX, footY - 22);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = '#dc2626';
-      ctx.fillRect(manX - 1, footY - 28, 2, 8);
-      // Arms cheering up
-      ctx.fillStyle = '#0f172a';
-      ctx.fillRect(manX - 9, footY - 36, 3, 16);
-      ctx.fillRect(manX + 6, footY - 36, 3, 16);
-      // Head
-      ctx.fillStyle = '#fbcfe8';
-      ctx.beginPath();
-      ctx.arc(manX, footY - 36, 5.5, 0, 6.28);
-      ctx.fill();
-      // Black hair
-      ctx.fillStyle = '#0f172a';
-      ctx.beginPath();
-      ctx.arc(manX, footY - 38, 5.5, 3.14, 6.28);
-      ctx.fill();
-      // Sunglasses
-      ctx.fillStyle = '#000000';
-      ctx.fillRect(manX - 4, footY - 37, 8, 2.5);
-    }
+    // 4. Original friendly character standing on the road at CHARACTER_X
+    drawFinishCharacter(charX, roadTop);
+
     ctx.restore();
   }
 }
@@ -2832,6 +3126,9 @@ function renderCarBody(drawWheelAngle = wheelRot) {
 function car(drawX = CAR_X) {
   const drawW = CAR_DRAW_W;
   const drawH = CAR_DRAW_H;
+  // Align bottom of tires with same ground baseline (cy + 24)
+  const baselineOffset = 24;
+  const carTopOffset = baselineOffset - drawH;
 
   // Soft ground shadow under car tires that scales and softens when car lifts off or spins
   const liftDist = Math.max(0, CAR_REST_Y - cy);
@@ -2840,7 +3137,7 @@ function car(drawX = CAR_X) {
   ctx.save();
   ctx.fillStyle = `rgba(15, 23, 42, ${shadowAlpha})`;
   ctx.beginPath();
-  ctx.ellipse(drawX, Math.min(H - 4, CAR_REST_Y + drawH * 0.42), drawW * 0.42 * shadowScale, 4 * shadowScale, 0, 0, Math.PI * 2);
+  ctx.ellipse(drawX, Math.min(H - 4, CAR_REST_Y + baselineOffset), drawW * 0.42 * shadowScale, 4 * shadowScale, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 
@@ -2852,15 +3149,89 @@ function car(drawX = CAR_X) {
   }
 
   if (trimmedCarCanvas) {
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
+    // 4. VISIBILITY: thin soft cyan-white rim glow around it (shadowColor rgba(120, 230, 255, 0.55), shadowBlur about 8)
+    ctx.save();
+    ctx.shadowColor = CAR_GLOW_COLOR;
+    ctx.shadowBlur = CAR_GLOW_BLUR;
     ctx.shadowOffsetX = 0;
     ctx.shadowOffsetY = 0;
-    ctx.drawImage(trimmedCarCanvas, -drawW / 2, -drawH / 2, drawW, drawH);
+    ctx.drawImage(trimmedCarCanvas, -drawW / 2, carTopOffset, drawW, drawH);
+    ctx.restore();
+
+    // Dynamic rotating alloy rims copied from the car image
+    if (wheelSpritesReady && rearWheelSprite && frontWheelSprite) {
+      try {
+        const rearX = -drawW / 2 + drawW * WHEEL_REAR_X;
+        const frontX = -drawW / 2 + drawW * WHEEL_FRONT_X;
+        const wheelY = carTopOffset + drawH * WHEEL_Y;
+        const rimR = drawW * WHEEL_SPIN_RADIUS;
+        const rimD = rimR * 2;
+
+        // Draw rear rim sprite concentric to axle (spins only the rim; tire & wheel arch stay static)
+        ctx.save();
+        ctx.translate(rearX, wheelY);
+        ctx.rotate(wheelAngle);
+        ctx.drawImage(rearWheelSprite, -rimR, -rimR, rimD, rimD);
+        ctx.restore();
+
+        // Draw front rim sprite concentric to axle (spins only the rim; tire & wheel arch stay static)
+        ctx.save();
+        ctx.translate(frontX, wheelY);
+        ctx.rotate(wheelAngle);
+        ctx.drawImage(frontWheelSprite, -rimR, -rimR, rimD, rimD);
+        ctx.restore();
+
+        // Motion blur at high spin speed: draw wheel a second time rotated by a small extra angle with alpha 0.35
+        const isHighSpin = (Math.abs(currentAngularSpeed) > 12) || (thrustSpinMultiplier > 1.25);
+        if (isHighSpin) {
+          const blurOffset = 0.08 * (currentAngularSpeed >= 0 ? 1 : -1);
+          ctx.save();
+          ctx.globalAlpha = 0.35;
+          ctx.translate(rearX, wheelY);
+          ctx.rotate(wheelAngle - blurOffset);
+          ctx.drawImage(rearWheelSprite, -rimR, -rimR, rimD, rimD);
+          ctx.restore();
+
+          ctx.save();
+          ctx.globalAlpha = 0.35;
+          ctx.translate(frontX, wheelY);
+          ctx.rotate(wheelAngle - blurOffset);
+          ctx.drawImage(frontWheelSprite, -rimR, -rimR, rimD, rimD);
+          ctx.restore();
+        }
+
+        // Debug green circles at wheel positions (false by default)
+        if (SHOW_WHEEL_DEBUG) {
+          ctx.save();
+          ctx.lineWidth = 1.2;
+          ctx.strokeStyle = '#00ff00';
+          ctx.beginPath();
+          ctx.arc(rearX, wheelY, rimR, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(frontX, wheelY, rimR, 0, Math.PI * 2);
+          ctx.stroke();
+          // Thin circle for outer tire radius
+          const tireR = drawW * WHEEL_RADIUS;
+          ctx.strokeStyle = '#22c55e';
+          ctx.beginPath();
+          ctx.arc(rearX, wheelY, tireR, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(frontX, wheelY, tireR, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+      } catch (err) {
+        console.warn('Failed to render wheel sprites:', err);
+      }
+    }
   } else {
     // Fallback to drawn car if image fails to load
+    ctx.save();
     ctx.scale(CAR_SCALE, CAR_SCALE);
     renderCarBody(wheelRot);
+    ctx.restore();
   }
   ctx.restore();
 }
@@ -2893,6 +3264,27 @@ function drawBackground() {
       ctx.fillStyle = '#48cae4';
       ctx.fillRect(0, 0, W, H);
     }
+  }
+}
+
+function spawnTireDust() {
+  const drawW = CAR_DRAW_W;
+  const drawH = CAR_DRAW_H;
+  const carTopOffset = 24 - drawH;
+  const rearOx = -drawW / 2 + drawW * WHEEL_REAR_X;
+  const frontOx = -drawW / 2 + drawW * WHEEL_FRONT_X;
+  const wheelY = cy + carTopOffset + drawH * WHEEL_Y + (drawW * WHEEL_RADIUS) * 0.9;
+  for (const ox of [rearOx, frontOx]) {
+    parts.push({
+      x: carDrawX + ox + rnd(-3, 3),
+      y: wheelY + rnd(-1, 2),
+      vx: rnd(-45, -15),
+      vy: rnd(-5, 0),
+      l: 0,
+      m: rnd(0.2, 0.35),
+      size: rnd(2.5, 4.5),
+      color: 'rgba(255, 255, 255, 0.65)'
+    });
   }
 }
 
@@ -2984,31 +3376,12 @@ function step(dt) {
     const wx = cam + CAR_X;
     const progress = getLevelProgress();
 
-    // Requirement 2: Auto Landing
-    // Take over car with smooth autopilot as soon as the last spike has passed the car (wx >= TUNNEL_END_X).
-    if (wx >= TUNNEL_END_X && !autoLanding) {
-      autoLanding = true;
-      landingStartY = cy;
-    }
-
-    if (autoLanding || stopping) {
+    if (stopping) {
       hold = false;
       thrust = 0;
     }
 
-    if (autoLanding) {
-      if (wx < FINISH_ROAD_X) {
-        // Calm open area of CALM_OPEN_GAP (300px): ease in and out toward CAR_REST_Y
-        const landT = Math.max(0, Math.min(1.0, (wx - TUNNEL_END_X) / CALM_OPEN_GAP));
-        const easeT = landT * landT * (3 - 2 * landT);
-        cy = landingStartY + (CAR_REST_Y - landingStartY) * easeT;
-        vy = 0;
-      } else {
-        // Tires touch asphalt exactly when car is above the finish road
-        cy = CAR_REST_Y;
-        vy = 0;
-      }
-    } else if (isLevelIntro) {
+    if (isLevelIntro) {
       levelIntroTimer += dt;
       const t = Math.min(1.0, levelIntroTimer / INTRO_SPIN_DURATION);
 
@@ -3048,6 +3421,7 @@ function step(dt) {
         carRollAngle = 0;
       }
     } else if (!stopping) {
+      // 1. After the last spike, the player keeps full control of the car (thrust and release work exactly as in the tunnel, with the same physics)
       if (hold) {
         vy -= LIFT_ACCEL * dt;
         thrust = Math.min(1, thrust + dt / THRUST_RISE_TIME);
@@ -3058,8 +3432,11 @@ function step(dt) {
       vy = Math.max(-MAX_UP_SPEED, Math.min(MAX_DOWN_SPEED, vy));
       cy += vy * dt;
 
+      // 2. The finish road works as a floor: when the car sinks onto it, the tires rest on the asphalt (the same rule as the start road). The player lands the car himself.
       const onStartPlatform = (wx >= START_ROAD_START && wx <= START_ROAD_END);
-      if (onStartPlatform) {
+      const onFinishPlatform = (wx >= FINISH_ROAD_X && wx <= FINISH_ROAD_END);
+      const onRoadPlatform = onStartPlatform || onFinishPlatform;
+      if (onRoadPlatform) {
         if (!hold && cy >= CAR_REST_Y) {
           cy = CAR_REST_Y;
           vy = 0;
@@ -3070,149 +3447,230 @@ function step(dt) {
         }
       }
 
+      // 3. Safety fallback only if needed: if the road has passed under the car's front and the car is still in the air, then, and only then, ease the car down gently to the road in about 0.6 seconds, with no sudden drop.
+      const carFrontWx = wx + CAR_DRAW_W * 0.5;
+      if (carFrontWx >= FINISH_ROAD_X && cy < CAR_REST_Y - 2 && !safetyLanding) {
+        safetyLanding = true;
+        safetyLandingStartY = cy;
+        safetyLandingTimer = 0;
+      }
+
+      if (safetyLanding) {
+        safetyLandingTimer += dt;
+        const t = Math.min(1.0, safetyLandingTimer / 0.6);
+        const easeT = t * t * (3 - 2 * t);
+        cy = safetyLandingStartY + (CAR_REST_Y - safetyLandingStartY) * easeT;
+        vy = 0;
+        if (t >= 1.0 || cy >= CAR_REST_Y) {
+          cy = CAR_REST_Y;
+          safetyLanding = false;
+        }
+      }
+
+      // Ceiling and floor boundaries
       if (cy < 16) { cy = 16; vy = 0; }
       if (cy > H - 16) { cy = H - 16; vy = 0; }
     }
 
-    // Touchdown smoke puff when car first lands on the finish road
+    // Start finish run as soon as car lands on finish road for the first time
     if (!hasTouchedDown && wx >= FINISH_ROAD_X && cy >= CAR_REST_Y - 2) {
       hasTouchedDown = true;
+      finishRunStage = 'speed_run';
+      finishRunTimer = 0;
+      landingScrollSpeed = sp;
+      hold = false;
+      thrust = 0;
+      playWinSound(); // Play existing level-end sound
+
+      // Initial touchdown tire puff
       const drawW = CAR_DRAW_W;
       const drawH = CAR_DRAW_H;
+      const carTopOffset = 24 - drawH;
       const rearOx = -drawW / 2 + drawW * WHEEL_REAR_X;
       const frontOx = -drawW / 2 + drawW * WHEEL_FRONT_X;
-      const wheelY = cy + drawH * (WHEEL_Y - 0.5) + (drawW * WHEEL_RADIUS) * 0.9;
+      const wheelY = cy + carTopOffset + drawH * WHEEL_Y + (drawW * WHEEL_RADIUS) * 0.9;
       for (const ox of [rearOx, frontOx]) {
         for (let k = 0; k < 6; k++) {
           parts.push({
-            x: CAR_X + ox + rnd(-6, 6),
-            y: wheelY + rnd(-2, 4),
-            vx: rnd(-90, -30),
-            vy: rnd(-25, 5),
+            x: CAR_X + ox + rnd(-5, 5),
+            y: wheelY + rnd(-2, 3),
+            vx: rnd(-80, -25),
+            vy: rnd(-20, 5),
             l: 0,
-            m: rnd(0.25, 0.45),
-            size: rnd(5, 9)
+            m: rnd(0.2, 0.4),
+            size: rnd(4, 8)
           });
         }
       }
     }
 
-    // Car accelerates fast forward right as it lands on the road (finish road surge)
-    let finishBoost = 1.0;
-    if (wx >= FINISH_ROAD_X) {
-      const distOnRoad = Math.max(0, wx - FINISH_ROAD_X);
-      const accelDist = 120; // Accelerates to high speed quickly on touchdown
-      const boostT = Math.min(1.0, distOnRoad / accelDist);
-      const easeT = boostT * boostT * (3 - 2 * boostT);
-      finishBoost = 1.0 + 1.8 * easeT; // Surges to 2.8x speed forward along the road
-    }
+    const camStop = FINISH_ROAD_END - ROAD_END_STOP_X;
+    const easeDist = FINISH_RUN_SPEED * 0.5 * 0.5; // distance during 0.5s deceleration = 0.30 * W
+    const wheelRadiusPx = CAR_DRAW_W * WHEEL_RADIUS;
 
-    // When the finish line is reached, car begins smooth deceleration to a complete stop
-    if (wx >= FINISH_LINE_X && !stopping && cy >= CAR_REST_Y - 2) {
-      stopping = true;
-      stopTimer = 0;
-      winCelebrated = false;
-    }
-
-    let ease = 1;
-    if (stopping) {
-      stopTimer += dt;
-      if (stopTimer < STOP_TIME) {
-        // Smooth cubic ease-out braking from sprint speed down to a dead stop
-        const t = stopTimer / STOP_TIME;
-        ease = Math.max(0, Math.pow(1 - t, 2.2));
-      } else {
-        ease = 0;
-      }
-
-      cy = CAR_REST_Y;
-      vy = 0;
+    if (finishRunStage !== 'none') {
       hold = false;
       thrust = 0;
+      cy = CAR_REST_Y;
+      vy = 0;
+      carRollAngle = 0;
 
-      // When the car comes to a complete halt on the road:
-      if (ease === 0 && !winCelebrated) {
-        winCelebrated = true;
-        playWinSound();
-        initConfetti();
+      if (finishRunStage === 'speed_run') {
+        finishRunTimer += dt;
+        const accelT = Math.min(1.0, finishRunTimer / 0.5);
+        const currentScrollSp = lerp(landingScrollSpeed, FINISH_RUN_SPEED, accelT);
+        cam += currentScrollSp * dt;
+        carDrawX = CAR_X;
+
+        // Wheels spin at their fastest speed
+        if (wheelRadiusPx > 0) {
+          const maxSpin = (FINISH_RUN_SPEED / wheelRadiusPx) * 2.5;
+          wheelAngle += maxSpin * dt;
+          wheelRot = wheelAngle;
+        }
+
+        // Subtle white dust at the tires
+        if (Math.random() < 0.35) {
+          spawnTireDust();
+        }
+
+        // Check when road end is approaching ROAD_END_STOP_X to ease to full stop in 0.5s
+        if (cam >= camStop - easeDist) {
+          finishRunStage = 'scroll_stopping';
+          scrollStopTimer = 0;
+          camEaseStart = cam;
+          camEaseDist = Math.max(0, camStop - cam);
+        }
+      } else if (finishRunStage === 'scroll_stopping') {
+        scrollStopTimer += dt;
+        const t = Math.min(1.0, scrollStopTimer / 0.5);
+        const progressEase = 1 - Math.pow(1 - t, 2);
+        cam = camEaseStart + camEaseDist * progressEase;
+        carDrawX = CAR_X;
+
+        const currentScrollSp = FINISH_RUN_SPEED * (1 - t);
+        if (wheelRadiusPx > 0) {
+          const spinRate = (currentScrollSp / wheelRadiusPx) * 2.5;
+          wheelAngle += spinRate * dt;
+          wheelRot = wheelAngle;
+        }
+
+        if (Math.random() < 0.25) {
+          spawnTireDust();
+        }
+
+        if (t >= 1.0) {
+          cam = camStop;
+          finishRunStage = 'car_driving';
+          carDriveTimer = 0;
+        }
+      } else if (finishRunStage === 'car_driving') {
+        cam = camStop;
+        carDriveTimer += dt;
+        const driveDuration = 1.2;
+        const t = Math.min(1.0, carDriveTimer / driveDuration);
+        const easeDrive = 1 - Math.pow(1 - t, 2.5);
+        const targetCarX = CAR_STOP_FRONT_X - CAR_DRAW_W * 0.5;
+        carDrawX = CAR_X + (targetCarX - CAR_X) * easeDrive;
+
+        // Wheels spin as car drives and brakes smoothly
+        const currentCarSpeed = ((targetCarX - CAR_X) * 2.5 * Math.pow(1 - t, 1.5)) / driveDuration;
+        if (wheelRadiusPx > 0) {
+          const spinRate = (currentCarSpeed / wheelRadiusPx) * 2.0;
+          wheelAngle += spinRate * dt;
+          wheelRot = wheelAngle;
+        }
+
+        // Confetti starts when car crosses finish line
+        const carFrontScreen = carDrawX + CAR_DRAW_W * 0.5;
+        if (carFrontScreen >= FINISH_LINE_X && !confettiStarted) {
+          confettiStarted = true;
+          initConfetti();
+        }
+
+        if (t >= 1.0) {
+          carDrawX = targetCarX;
+          finishRunStage = 'car_stopped';
+          thumbsUpTimer = 0;
+        }
+      } else if (finishRunStage === 'car_stopped') {
+        cam = camStop;
+        const targetCarX = CAR_STOP_FRONT_X - CAR_DRAW_W * 0.5;
+        carDrawX = targetCarX;
+
+        thumbsUpTimer += dt;
+        // One second after thumbs-up starts, show "Level N Clear!" popup and save progress
+        if (thumbsUpTimer >= 1.0 && !levelCompleted) {
+          levelCompleted = true;
+          st = 'level_complete';
+          levelCompleteTimer = 0;
+          levelJustCleared = curLevel;
+          const nextLvl = curLevel + 1;
+          const clearScore = 100 * curLevel;
+          if (clearScore > best) best = clearScore;
+          saveProgress(curLevel, Math.max(highestLevel, nextLvl), best);
+        }
       }
-
-      // After coming to a complete stop on the road, show Level Complete screen
-      if (stopTimer >= STOP_TIME + 0.75) {
-        st = 'level_complete';
-        stopping = false;
-        autoLanding = false;
-        hold = false;
-        vy = 0;
-        cy = CAR_REST_Y;
-        levelCompleteTimer = 0;
-        levelJustCleared = curLevel;
-        const nextLvl = curLevel + 1;
-        const clearScore = 100 * curLevel;
-        if (clearScore > best) best = clearScore;
-        saveProgress(curLevel, Math.max(highestLevel, nextLvl), best);
-      }
-    }
-
-    let launchBoost = 1.0;
-    if (isLevelIntro) {
-      const t = Math.min(1.0, levelIntroTimer / INTRO_SPIN_DURATION);
-      // High-speed turbo surge rushing the car inside the tunnel as it spins
-      launchBoost = 1.0 + 2.5 * Math.sin(t * Math.PI);
-    }
-
-    const effectiveSp = sp * finishBoost * launchBoost * ease;
-    cam += effectiveSp * dt;
-
-    if (SHOW_DEBUG) {
-      updateRealSpeedMeasurement(performance.now() / 1000);
-    }
-
-    const onStartPlatform = (wx >= START_ROAD_START && wx <= START_ROAD_END);
-    const onFinishPlatform = (wx >= FINISH_ROAD_X && wx <= FINISH_ROAD_END);
-    const onRoadPlatform = onStartPlatform || onFinishPlatform;
-
-    // Wheel spin angular speed physics:
-    // Follows scroll speed; spins normal speed on road; slows down smoothly as car stops
-    const wheelRadiusPx = CAR_DRAW_W * WHEEL_RADIUS;
-    const targetSpinMult = (hold && !autoLanding && !stopping) ? 2.2 : 1.0;
-    if (thrustSpinMultiplier < targetSpinMult) {
-      thrustSpinMultiplier = Math.min(targetSpinMult, thrustSpinMultiplier + (1.2 / 0.08) * dt);
-    } else if (thrustSpinMultiplier > targetSpinMult) {
-      thrustSpinMultiplier = Math.max(targetSpinMult, thrustSpinMultiplier - (1.2 / 0.30) * dt);
-    }
-
-    if (wheelRadiusPx > 0 && effectiveSp > 0) {
-      currentAngularSpeed = (effectiveSp / wheelRadiusPx) * thrustSpinMultiplier;
     } else {
-      currentAngularSpeed = 0;
+      // Normal game scrolling before finish road touchdown
+      let launchBoost = 1.0;
+      if (isLevelIntro) {
+        const t = Math.min(1.0, levelIntroTimer / INTRO_SPIN_DURATION);
+        launchBoost = 1.0 + 2.5 * Math.sin(t * Math.PI);
+      }
+      const effectiveSp = sp * launchBoost;
+      cam += effectiveSp * dt;
+
+      if (SHOW_DEBUG) {
+        updateRealSpeedMeasurement(performance.now() / 1000);
+      }
+
+      // Wheel spin angular speed physics
+      const targetSpinMult = hold ? 2.2 : 1.0;
+      if (thrustSpinMultiplier < targetSpinMult) {
+        thrustSpinMultiplier = Math.min(targetSpinMult, thrustSpinMultiplier + (1.2 / 0.08) * dt);
+      } else if (thrustSpinMultiplier > targetSpinMult) {
+        thrustSpinMultiplier = Math.max(targetSpinMult, thrustSpinMultiplier - (1.2 / 0.30) * dt);
+      }
+      if (wheelRadiusPx > 0 && effectiveSp > 0) {
+        currentAngularSpeed = (effectiveSp / wheelRadiusPx) * thrustSpinMultiplier;
+      } else {
+        currentAngularSpeed = 0;
+      }
+      wheelAngle += currentAngularSpeed * dt;
+      wheelRot = wheelAngle;
+      carDrawX = CAR_X;
+
+      const onStartPlatform = (wx >= START_ROAD_START && wx <= START_ROAD_END);
+      const onFinishPlatform = (wx >= FINISH_ROAD_X && wx <= FINISH_ROAD_END);
+      const onRoadPlatform = onStartPlatform || onFinishPlatform;
+      const isCarOnRoad = onRoadPlatform && (cy >= CAR_REST_Y - 2);
+      const isCarInAir = !isCarOnRoad;
+
+      // Wheel thruster smoke during normal flight
+      if (hold && isCarInAir && st === 'play') {
+        const drawW = CAR_DRAW_W;
+        const drawH = CAR_DRAW_H;
+        const carTopOffset = 24 - drawH;
+        const rearWheelOx = -drawW / 2 + drawW * WHEEL_REAR_X;
+        const frontWheelOx = -drawW / 2 + drawW * WHEEL_FRONT_X;
+        const smokeY = cy + carTopOffset + drawH * WHEEL_Y + (drawW * WHEEL_RADIUS) * 0.9;
+        for (const ox of [rearWheelOx, frontWheelOx]) {
+          parts.push({
+            x: CAR_X + ox,
+            y: smokeY,
+            vx: rnd(-3, 3) - effectiveSp * 0.15,
+            vy: rnd(140, 230),
+            l: 0,
+            m: rnd(0.3, 0.45),
+            size: rnd(4, 7) * (CAR_SCALE * 0.6)
+          });
+        }
+      }
     }
 
-    wheelAngle += currentAngularSpeed * dt;
-    wheelRot = wheelAngle;
-
-    const isCarOnRoad = onRoadPlatform && (cy >= CAR_REST_Y - 2);
-    const isCarInAir = !isCarOnRoad;
-
-    // Requirement 2: No smoke during landing, driving on road, or stopping
-    if (hold && isCarInAir && st === 'play' && !autoLanding && !stopping) {
-      const drawW = CAR_DRAW_W;
-      const drawH = CAR_DRAW_H;
-      const rearWheelOx = -drawW / 2 + drawW * 0.1843;
-      const frontWheelOx = -drawW / 2 + drawW * 0.8190;
-      const smokeY = cy + drawH / 2;
-
-      for (const ox of [rearWheelOx, frontWheelOx]) {
-        parts.push({
-          x: CAR_X + ox,
-          y: smokeY,
-          vx: rnd(-3, 3) - effectiveSp * 0.15,
-          vy: rnd(140, 230),
-          l: 0,
-          m: rnd(0.3, 0.45),
-          size: rnd(4, 7) * (CAR_SCALE * 0.6)
-        });
-      }
+    if (confettiStarted) {
+      updateConfetti(dt);
     }
 
     if (nextX < cam + W + 400) addSeg(true, 400);
@@ -3232,7 +3690,7 @@ function step(dt) {
 
     for (const s of segs) {
       // Requirement 6: Crash cannot happen after the last spike or during launch spin
-      if (stopping || autoLanding || wx >= TUNNEL_END_X || isLevelIntro) break;
+      if (stopping || wx >= TUNNEL_END_X || isLevelIntro) break;
       const curTop = (s.curTop !== undefined) ? s.curTop : s.top;
       const curBot = (s.curBot !== undefined) ? s.curBot : s.bot;
       if (wx + HITBOX_HALF_W > s.x && wx - HITBOX_HALF_W < s.x + s.w && !s.isOpen) {
@@ -3313,13 +3771,13 @@ function drawLoadingScreen() {
 
     ctx.translate(carCenterX, carCenterY);
 
-    // Warm golden glow behind the yellow hypercar
+    // Very soft warm yellow glow behind the car
     ctx.save();
     const glowR = loadW * 0.54;
     const glowGrad = ctx.createRadialGradient(0, 0, 5, 0, 0, glowR);
-    glowGrad.addColorStop(0, 'rgba(250, 204, 21, 0.45)');
-    glowGrad.addColorStop(0.5, 'rgba(253, 224, 71, 0.20)');
-    glowGrad.addColorStop(1, 'rgba(253, 224, 71, 0)');
+    glowGrad.addColorStop(0, 'rgba(253, 224, 71, 0.38)');
+    glowGrad.addColorStop(0.5, 'rgba(250, 204, 21, 0.16)');
+    glowGrad.addColorStop(1, 'rgba(250, 204, 21, 0)');
     ctx.fillStyle = glowGrad;
     ctx.beginPath();
     ctx.arc(0, 0, glowR, 0, Math.PI * 2);
@@ -3347,12 +3805,34 @@ function drawLoadingScreen() {
     }
     ctx.restore();
 
-    // High performance sports car image
+    // Dark blue futuristic coupe image
     if (trimmedCarCanvas) {
-      ctx.shadowColor = 'rgba(15, 23, 62, 0.35)';
-      ctx.shadowBlur = 8;
-      ctx.shadowOffsetY = 2;
+      ctx.save();
+      ctx.shadowColor = CAR_GLOW_COLOR;
+      ctx.shadowBlur = CAR_GLOW_BLUR;
       ctx.drawImage(trimmedCarCanvas, -loadW / 2, -loadH / 2, loadW, loadH);
+      ctx.restore();
+
+      // Rotating alloy rims on loading screen
+      if (wheelSpritesReady && rearWheelSprite && frontWheelSprite) {
+        const loadRearX = -loadW / 2 + loadW * WHEEL_REAR_X;
+        const loadFrontX = -loadW / 2 + loadW * WHEEL_FRONT_X;
+        const loadWheelY = -loadH / 2 + loadH * WHEEL_Y;
+        const loadWheelR = loadW * WHEEL_SPIN_RADIUS;
+        const loadWheelD = loadWheelR * 2;
+
+        ctx.save();
+        ctx.translate(loadRearX, loadWheelY);
+        ctx.rotate(loadingWheelRot);
+        ctx.drawImage(rearWheelSprite, -loadWheelR, -loadWheelR, loadWheelD, loadWheelD);
+        ctx.restore();
+
+        ctx.save();
+        ctx.translate(loadFrontX, loadWheelY);
+        ctx.rotate(loadingWheelRot);
+        ctx.drawImage(frontWheelSprite, -loadWheelR, -loadWheelR, loadWheelD, loadWheelD);
+        ctx.restore();
+      }
     } else {
       ctx.scale(carScale, carScale);
       renderCarBody(loadingWheelRot);
@@ -3383,11 +3863,11 @@ function drawLoadingScreen() {
   roundRect(ctx, barX, barY, barW, barH, barH / 2);
   ctx.stroke();
 
-  // Progress follows real loading progress with car matching vibrant yellow-to-orange gradient
+  // Progress follows real loading progress with car matching yellow-to-orange gradient
   const fillW = Math.max(barH, barW * visualLoadProgress);
   const fillGrad = ctx.createLinearGradient(0, barY, 0, barY + barH);
   fillGrad.addColorStop(0, '#fef08a');
-  fillGrad.addColorStop(0.40, '#facc15');
+  fillGrad.addColorStop(0.45, '#facc15');
   fillGrad.addColorStop(1, '#ea580c');
   ctx.fillStyle = fillGrad;
   roundRect(ctx, barX, barY, fillW, barH, barH / 2);
@@ -3811,12 +4291,12 @@ function drawGameContent() {
     car(CAR_X);
     ctx.restore();
   } else {
-    car(CAR_X);
+    car(carDrawX);
   }
 
   // 7. UI and Screens (all HUD text in white with dark outline)
   if (st === 'play') {
-    if (stopping) {
+    if (stopping || confettiStarted) {
       drawConfetti();
     }
     drawHUD();
@@ -4092,7 +4572,7 @@ function handlePointerDown(e) {
   }
 
   if (st === 'play') {
-    if (!autoLanding && !stopping) {
+    if (!stopping && finishRunStage === 'none') {
       hold = true;
     }
   }
@@ -4187,7 +4667,7 @@ window.addEventListener('keydown', e => {
     if (!e.repeat) {
       if (st === 'ready') { startLevel(curLevel); st = 'play'; hold = true; }
       else if (st === 'play') {
-        if (!autoLanding && !stopping) {
+        if (!stopping && finishRunStage === 'none') {
           hold = true;
         }
       }
